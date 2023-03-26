@@ -1,4 +1,5 @@
 import Client, {Schema} from '@atlassian/bitbucket-server';
+import Bottleneck from 'bottleneck';
 import {AirbyteConfig, AirbyteLogger, wrapApiError} from 'faros-airbyte-cdk';
 import {
   Commit,
@@ -34,6 +35,7 @@ export interface BitbucketServerConfig extends AirbyteConfig {
 }
 
 const DEFAULT_PAGE_SIZE = 25;
+const MAX_ATTEMPTS = 3;
 
 type Dict = {[k: string]: any};
 type EmitFlags = {shouldEmit: boolean; shouldBreakEarly: boolean};
@@ -44,13 +46,19 @@ type ExtendedClient = Client & {
 
 export class BitbucketServer {
   private static bitbucket: BitbucketServer = null;
+  private readonly limiter: Bottleneck;
 
   constructor(
     private readonly client: ExtendedClient,
     private readonly pageSize: number,
     private readonly logger: AirbyteLogger,
     readonly startDate: Date
-  ) {}
+  ) {
+    this.limiter = new Bottleneck({
+      maxConcurrent: 1,
+      minTime: 250,
+    });
+  }
 
   static instance(
     config: BitbucketServerConfig,
@@ -129,6 +137,27 @@ export class BitbucketServer {
     }
   }
 
+  private wrapFetch<T extends Dict>(
+    fetch: (start: number) => Promise<Client.Response<T>>
+  ): (start: number) => Promise<Client.Response<T>> {
+    return async (start: number): Promise<Client.Response<T>> => {
+      let attempt = 1;
+      while (attempt <= MAX_ATTEMPTS) {
+        try {
+          return await this.limiter.schedule(() => fetch(start));
+        } catch (err: any) {
+          if (err.code >= 500 && attempt + 1 <= MAX_ATTEMPTS) {
+            const sleep = Math.pow(2, attempt) * 250;
+            await new Promise((resolve) => setTimeout(resolve, sleep));
+          } else {
+            throw err;
+          }
+        }
+        attempt++;
+      }
+    };
+  }
+
   private async *paginate<T extends Dict, U>(
     fetch: (start: number) => Promise<Client.Response<T>>,
     toStreamData: (data: Dict) => AsyncOrSync<U>,
@@ -136,7 +165,8 @@ export class BitbucketServer {
       return {shouldEmit: true, shouldBreakEarly: false};
     }
   ): AsyncGenerator<U> {
-    let {data: page} = await fetch(0);
+    const wrappedFetch = this.wrapFetch(fetch);
+    let {data: page} = await wrappedFetch(0);
     if (!page) return;
     if (!Array.isArray(page.values)) {
       yield toStreamData(page);
@@ -152,7 +182,9 @@ export class BitbucketServer {
           return;
         }
       }
-      page = page.nextPageStart ? (await fetch(page.nextPageStart)).data : null;
+      page = page.nextPageStart
+        ? (await wrappedFetch(page.nextPageStart)).data
+        : null;
     } while (page);
   }
 
@@ -197,10 +229,7 @@ export class BitbucketServer {
     }
   }
 
-  async *tags(
-    projectKey: string,
-    repositorySlug: string
-  ): AsyncGenerator<Tag> {
+  async *tags(projectKey: string, repositorySlug: string): AsyncGenerator<Tag> {
     const fullName = repoFullName(projectKey, repositorySlug);
     try {
       this.logger.debug(`Fetching tags for repository ${fullName}`);
@@ -217,7 +246,7 @@ export class BitbucketServer {
             ...data,
             computedProperties: {repository: {fullName}},
           } as Tag;
-        },
+        }
       );
     } catch (err) {
       throw new VError(
