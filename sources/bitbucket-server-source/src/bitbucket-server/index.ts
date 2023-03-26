@@ -248,6 +248,23 @@ export class BitbucketServer {
           } as Tag;
         }
       );
+      // Emit HEAD tag for every branch
+      yield* this.paginate<Dict, Tag>(
+        (start) =>
+          this.client[MEP].repos.getBranches({
+            projectKey,
+            repositorySlug,
+            start,
+            limit: this.pageSize,
+          }),
+        (data) => {
+          // TODO: remove default field in response
+          return {
+            ...data,
+            computedProperties: {repository: {fullName}},
+          } as Tag;
+        }
+      );
     } catch (err) {
       throw new VError(
         innerError(err),
