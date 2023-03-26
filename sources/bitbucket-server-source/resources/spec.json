@@ -58,6 +58,18 @@
         "description": "Page size to use when requesting records from Bitbucket Server API",
         "default": 25
       },
+      "rate_limit": {
+        "type": "integer",
+        "title": "Rate Limit",
+        "description": "Minimum time between API requests, given as a number of milliseconds",
+        "default": 250
+      },
+      "retries": {
+        "type": "integer",
+        "title": "Retries",
+        "description": "Number of retries to make when a request fails",
+        "default": 2
+      },
       "reject_unauthorized": {
         "type": "boolean",
         "title": "Enforce Certificate Validation",

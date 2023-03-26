@@ -31,11 +31,14 @@ export interface BitbucketServerConfig extends AirbyteConfig {
   readonly repositories?: ReadonlyArray<string>;
   readonly page_size?: number;
   readonly cutoff_days?: number;
+  readonly retries?: number;
+  readonly rate_limit?: number;
   readonly reject_unauthorized?: boolean;
 }
 
 const DEFAULT_PAGE_SIZE = 25;
-const MAX_ATTEMPTS = 3;
+const DEFAULT_RATE_LIMIT = 250;
+const DEFAULT_RETRIES = 2;
 
 type Dict = {[k: string]: any};
 type EmitFlags = {shouldEmit: boolean; shouldBreakEarly: boolean};
@@ -47,16 +50,20 @@ type ExtendedClient = Client & {
 export class BitbucketServer {
   private static bitbucket: BitbucketServer = null;
   private readonly limiter: Bottleneck;
+  private readonly maxAttempts: number;
 
   constructor(
     private readonly client: ExtendedClient,
     private readonly pageSize: number,
     private readonly logger: AirbyteLogger,
-    readonly startDate: Date
+    readonly startDate: Date,
+    readonly retries: number,
+    readonly rateLimit: number
   ) {
+    this.maxAttempts = 1 + retries;
     this.limiter = new Bottleneck({
       maxConcurrent: 1,
-      minTime: 250,
+      minTime: rateLimit,
     });
   }
 
@@ -87,9 +94,19 @@ export class BitbucketServer {
     client.authenticate(auth as Client.Auth);
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - config.cutoff_days);
-    const pageSize = config.page_size ?? DEFAULT_PAGE_SIZE;
 
-    const bb = new BitbucketServer(client, pageSize, logger, startDate);
+    const pageSize = config.page_size ?? DEFAULT_PAGE_SIZE;
+    const retries = config.retries ?? DEFAULT_RETRIES;
+    const rateLimit = config.rate_limit ?? DEFAULT_RATE_LIMIT;
+
+    const bb = new BitbucketServer(
+      client,
+      pageSize,
+      logger,
+      startDate,
+      retries,
+      rateLimit
+    );
     BitbucketServer.bitbucket = bb;
     logger.debug(`Created Bitbucket Server instance with ${auth.type} auth`);
     return BitbucketServer.bitbucket;
@@ -142,11 +159,11 @@ export class BitbucketServer {
   ): (start: number) => Promise<Client.Response<T>> {
     return async (start: number): Promise<Client.Response<T>> => {
       let attempt = 1;
-      while (attempt <= MAX_ATTEMPTS) {
+      while (attempt <= this.maxAttempts) {
         try {
           return await this.limiter.schedule(() => fetch(start));
         } catch (err: any) {
-          if (err.code >= 500 && attempt + 1 <= MAX_ATTEMPTS) {
+          if (err.code >= 500 && attempt + 1 <= this.maxAttempts) {
             const sleep = Math.pow(2, attempt) * 250;
             await new Promise((resolve) => setTimeout(resolve, sleep));
           } else {
